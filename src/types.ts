@@ -1,17 +1,19 @@
 export type EmergencyType = 'medical' | 'fire' | 'police';
 
+export type IncidentSeverity = 'MILD' | 'MODERATE' | 'SEVERE' | 'CRITICAL';
+
 export type IncidentStatus = 
-  | 'pending'        // Just created by citizen, waiting for dispatch
-  | 'assigned'       // Dispatch assigned responder, awaiting responder accept
-  | 'en_route'       // Responder accepted, driving to citizen
-  | 'on_scene'       // Responder reached citizen / scene
-  | 'transporting'   // Patient secured, driving to selected hospital
-  | 'resolved'       // Hospital received patient / Incident closed
+  | 'pending'        // Created by citizen, waiting for dispatch
+  | 'assigned'       // Dispatch assigned responder
+  | 'en_route'       // Responder accepted, navigating to scene
+  | 'on_scene'       // Responder reached scene / patient
+  | 'transporting'   // Patient secured, navigating to auto-assigned hospital
+  | 'resolved'       // Hospital admitted patient / Incident closed
   | 'cancelled';     // Citizen cancelled false alarm
 
 export interface PatientVitals {
   condition: string;
-  severity: 'CRITICAL' | 'SERIOUS' | 'STABLE';
+  severity: IncidentSeverity;
   bloodPressure?: string;
   heartRate?: number;
   oxygenSat?: number;
@@ -26,24 +28,33 @@ export interface IncidentTimelineEvent {
   actor: 'Citizen' | 'Dispatch' | 'Responder' | 'Hospital' | 'System';
 }
 
+export interface NavigationStep {
+  instruction: string;
+  distanceMeters: number;
+  durationSeconds: number;
+  type: 'turn-left' | 'turn-right' | 'continue' | 'arrive' | 'depart' | 'roundabout';
+  streetName?: string;
+}
+
 export interface Incident {
   id: string;
   type: EmergencyType;
   title: string;
-  description: string;
+  description?: string;
+  severity?: IncidentSeverity;
   status: IncidentStatus;
   lat: number;
   lng: number;
   address: string;
   createdAt: number;
   updatedAt: number;
+  citizenToken?: string;
   assignedUnitId?: string;
-  targetHospitalId?: string;
+  assignedHospitalId?: string;
   patientVitals?: PatientVitals;
   etaSeconds: number;
   distanceKm: number;
   timeline: IncidentTimelineEvent[];
-  isDemoIncident?: boolean;
 }
 
 export type ResponderType = 'ambulance' | 'firetruck' | 'police_cruiser';
@@ -62,7 +73,7 @@ export interface ResponderUnit {
   type: ResponderType;
   status: ResponderStatus;
   badgeId: string;
-  pin: string;
+  pin?: string;
   driverName: string;
   lat: number;
   lng: number;
@@ -71,9 +82,11 @@ export interface ResponderUnit {
   batteryPercent: number;
   crew: string[];
   currentIncidentId?: string;
-  targetHospitalId?: string;
+  assignedHospitalId?: string;
   routeCoords?: [number, number][];
   routeIndex?: number;
+  navigationSteps?: NavigationStep[];
+  currentStepIndex?: number;
 }
 
 export interface Hospital {
@@ -91,16 +104,13 @@ export interface Hospital {
   phone: string;
 }
 
-export type PortalView = 
-  | 'pitch_grid' 
-  | 'public' 
-  | 'dispatch' 
-  | 'responder' 
-  | 'hospital';
+export type UserRole = 'dispatcher' | 'responder' | 'hospital';
 
-export interface CityLocation {
-  name: string;
-  lat: number;
-  lng: number;
-  zoom: number;
+export interface UserProfile {
+  id: string;
+  email: string;
+  fullName: string;
+  role: UserRole;
+  unitId?: string;
+  hospitalId?: string;
 }

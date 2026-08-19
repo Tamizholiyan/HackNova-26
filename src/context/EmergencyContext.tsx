@@ -4,86 +4,148 @@ import type {
   ResponderUnit, 
   Hospital, 
   EmergencyType, 
-  PatientVitals, 
-  PortalView 
+  IncidentSeverity,
+  PatientVitals 
 } from '../types';
 import { 
   INITIAL_HOSPITALS, 
   INITIAL_FLEET, 
   MARINA_BEACH_COORDS, 
-  calculateDistanceKm, 
-  generateRoutePoints 
+  calculateDistanceKm 
 } from '../utils/mockData';
+import { calculateTurnByTurnRoute } from '../utils/routingEngine';
 import { sound } from '../utils/audioSynth';
+import { supabase, isSupabaseConfigured } from '../lib/supabaseClient';
 
 interface EmergencyContextType {
   incidents: Incident[];
   fleet: ResponderUnit[];
   hospitals: Hospital[];
-  activeIncident: Incident | null;
-  activeResponder: ResponderUnit;
-  activeHospital: Hospital;
-  currentView: PortalView;
+  activeCitizenIncident: Incident | null;
   isMuted: boolean;
-  pitchStep: number;
-  isPitchPlaying: boolean;
   
   // Actions
-  setCurrentView: (view: PortalView) => void;
-  setActiveResponderId: (id: string) => void;
-  setActiveHospitalId: (id: string) => void;
   toggleMute: () => void;
   
   // Citizen actions
-  triggerCitizenSos: (type: EmergencyType, lat?: number, lng?: number, address?: string) => string;
-  cancelCitizenSos: (incidentId: string) => void;
+  triggerCitizenSos: (type: EmergencyType, lat?: number, lng?: number, address?: string) => Promise<string>;
+  updateCitizenIncidentDetails: (incidentId: string, severity: IncidentSeverity, description: string) => Promise<void>;
+  cancelCitizenSos: (incidentId: string) => Promise<void>;
   
   // Dispatch actions
-  assignResponderToIncident: (incidentId: string, unitId: string) => void;
+  assignResponderToIncident: (incidentId: string, unitId: string) => Promise<void>;
+  overrideAssignedHospital: (incidentId: string, hospitalId: string) => Promise<void>;
   
   // Responder actions
-  acceptMission: (unitId: string) => void;
-  markArrivedOnScene: (unitId: string) => void;
-  startHospitalTransport: (unitId: string, hospitalId: string, vitals?: PatientVitals) => void;
-  markArrivedAtHospital: (unitId: string) => void;
-  toggleDutyStatus: (unitId: string) => void;
+  acceptMission: (unitId: string) => Promise<void>;
+  markArrivedOnScene: (unitId: string) => Promise<void>;
+  startHospitalTransport: (unitId: string, vitals?: PatientVitals) => Promise<void>;
+  markArrivedAtHospital: (unitId: string) => Promise<void>;
+  toggleDutyStatus: (unitId: string) => Promise<void>;
   
   // Hospital actions
-  toggleHospitalCapacity: (hospitalId: string) => void;
-  receivePatientAdmit: (hospitalId: string, incidentId: string) => void;
+  toggleHospitalCapacity: (hospitalId: string) => Promise<void>;
+  receivePatientAdmit: (hospitalId: string, incidentId: string) => Promise<void>;
   
-  // Pitch & Story Mode
-  setPitchStep: (step: number) => void;
-  startGuidedPitch: () => void;
-  nextPitchStep: () => void;
-  resetToInitialDemo: () => void;
+  // Reset
+  resetData: () => Promise<void>;
 }
 
 const EmergencyContext = createContext<EmergencyContextType | undefined>(undefined);
 
-const BROADCAST_CHANNEL_NAME = 'resqnet_emergency_bus_v1';
+const BROADCAST_CHANNEL_NAME = 'resqnet_emergency_bus_v2';
+
+// Intelligent Auto-Hospital Assignment Algorithm
+export function findBestHospital(
+  incType: EmergencyType,
+  severity: IncidentSeverity | undefined,
+  incLat: number,
+  incLng: number,
+  hospitalsList: Hospital[]
+): Hospital | null {
+  const acceptingHospitals = hospitalsList.filter(h => h.status === 'accepting' && (h.totalBeds - h.occupiedBeds) > 0);
+  if (acceptingHospitals.length === 0) {
+    // If all are full, pick hospital with least occupancy as emergency overflow
+    return hospitalsList[0] || null;
+  }
+
+  // Score hospitals based on specialization, distance, and capacity
+  const scored = acceptingHospitals.map(h => {
+    let specScore = 0;
+    const specializations = h.specializations.map(s => s.toLowerCase());
+
+    if (incType === 'medical') {
+      if (severity === 'CRITICAL' || severity === 'SEVERE') {
+        if (specializations.some(s => s.includes('cardiac') || s.includes('trauma') || s.includes('critical'))) {
+          specScore += 15;
+        }
+      } else {
+        if (specializations.some(s => s.includes('general') || s.includes('emergency'))) {
+          specScore += 5;
+        }
+      }
+    } else if (incType === 'fire') {
+      if (specializations.some(s => s.includes('burn') || s.includes('trauma'))) {
+        specScore += 15;
+      }
+    }
+
+    const dist = calculateDistanceKm(incLat, incLng, h.lat, h.lng);
+    const distancePenalty = dist * 2; // closer is better
+    const availableBeds = h.totalBeds - h.occupiedBeds;
+    const capacityBonus = Math.min(10, availableBeds / 10);
+
+    const totalScore = specScore + capacityBonus - distancePenalty;
+
+    return { hospital: h, score: totalScore, distance: dist };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.hospital || acceptingHospitals[0];
+}
 
 export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [incidents, setIncidents] = useState<Incident[]>([]);
-  const [fleet, setFleet] = useState<ResponderUnit[]>(INITIAL_FLEET);
-  const [hospitals, setHospitals] = useState<Hospital[]>(INITIAL_HOSPITALS);
-  const [activeResponderId, setActiveResponderId] = useState<string>('unit-1');
-  const [activeHospitalId, setActiveHospitalId] = useState<string>('hosp-2'); // Hospital B (Apollo) default
-  const [currentView, setCurrentView] = useState<PortalView>('pitch_grid');
-  const [isMuted, setIsMuted] = useState<boolean>(false);
-  const [pitchStep, setPitchStep] = useState<number>(0);
-  const [isPitchPlaying, setIsPitchPlaying] = useState<boolean>(false);
+  const [incidents, setIncidents] = useState<Incident[]>(() => {
+    const saved = localStorage.getItem('resqnet_incidents_v2');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [fleet, setFleet] = useState<ResponderUnit[]>(() => {
+    const saved = localStorage.getItem('resqnet_fleet_v2');
+    return saved ? JSON.parse(saved) : INITIAL_FLEET;
+  });
+  const [hospitals, setHospitals] = useState<Hospital[]>(() => {
+    const saved = localStorage.getItem('resqnet_hospitals_v2');
+    return saved ? JSON.parse(saved) : INITIAL_HOSPITALS;
+  });
 
+  const [activeCitizenIncidentId, setActiveCitizenIncidentId] = useState<string | null>(() => {
+    return localStorage.getItem('resqnet_active_citizen_inc_id');
+  });
+
+  const [isMuted, setIsMuted] = useState<boolean>(false);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
 
-  // Initialize BroadcastChannel
+  // Sync to local storage for instant responsiveness
+  useEffect(() => {
+    localStorage.setItem('resqnet_incidents_v2', JSON.stringify(incidents));
+  }, [incidents]);
+
+  useEffect(() => {
+    localStorage.setItem('resqnet_fleet_v2', JSON.stringify(fleet));
+  }, [fleet]);
+
+  useEffect(() => {
+    localStorage.setItem('resqnet_hospitals_v2', JSON.stringify(hospitals));
+  }, [hospitals]);
+
+  // BroadcastChannel for cross-tab realtime sync
   useEffect(() => {
     try {
       const channel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
       broadcastChannelRef.current = channel;
 
       channel.onmessage = (event) => {
-        if (event.data && event.data.type === 'STATE_SYNC') {
+        if (event.data && event.data.type === 'SYNC_ALL') {
           const { incidents: newInc, fleet: newFleet, hospitals: newHosp } = event.data.payload;
           if (newInc) setIncidents(newInc);
           if (newFleet) setFleet(newFleet);
@@ -91,7 +153,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       };
     } catch {
-      // BroadcastChannel unsupported fallback
+      // safe fallback
     }
 
     return () => {
@@ -99,67 +161,194 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     };
   }, []);
 
-  // Broadcast state changes across tabs
-  const broadcastState = useCallback((newInc: Incident[], newFleet: ResponderUnit[], newHosp: Hospital[]) => {
+  const broadcastAll = useCallback((newInc: Incident[], newFleet: ResponderUnit[], newHosp: Hospital[]) => {
     try {
-      if (broadcastChannelRef.current) {
-        broadcastChannelRef.current.postMessage({
-          type: 'STATE_SYNC',
-          payload: { incidents: newInc, fleet: newFleet, hospitals: newHosp }
-        });
-      }
+      broadcastChannelRef.current?.postMessage({
+        type: 'SYNC_ALL',
+        payload: { incidents: newInc, fleet: newFleet, hospitals: newHosp }
+      });
     } catch {
-      // ignore
+      // safe fallback
     }
   }, []);
 
-  // Find active incident for public view
-  const activeIncident = incidents.find(inc => inc.status !== 'resolved' && inc.status !== 'cancelled') || null;
+  // Supabase Realtime Subscription if configured
+  useEffect(() => {
+    if (isSupabaseConfigured) {
+      // Fetch initial data from Supabase
+      supabase.from('hospitals').select('*').then(({ data }) => {
+        if (data && data.length > 0) {
+          const mapped: Hospital[] = data.map((h: any) => ({
+            id: h.id,
+            name: h.name,
+            shortCode: h.short_code || h.name.slice(0, 8),
+            status: h.status,
+            totalBeds: h.total_beds,
+            occupiedBeds: h.occupied_beds,
+            icuBedsAvailable: h.icu_beds_available,
+            specializations: h.specializations || [],
+            lat: h.lat,
+            lng: h.lng,
+            address: h.address || '',
+            phone: h.phone || '',
+          }));
+          setHospitals(mapped);
+        }
+      });
 
-  // Active responder unit
-  const activeResponder = fleet.find(f => f.id === activeResponderId) || fleet[0];
+      supabase.from('units').select('*').then(({ data }) => {
+        if (data && data.length > 0) {
+          const mapped: ResponderUnit[] = data.map((u: any) => ({
+            id: u.id,
+            callsign: u.callsign,
+            type: u.type === 'ambulance' ? 'ambulance' : u.type === 'fire' ? 'firetruck' : 'police_cruiser',
+            status: u.status,
+            badgeId: u.callsign,
+            driverName: u.crew || 'Duty Crew',
+            lat: u.lat,
+            lng: u.lng,
+            heading: 0,
+            speedKmh: u.speed_kmh || 0,
+            batteryPercent: u.battery_percent || 95,
+            crew: [u.crew || 'Lead Operator'],
+          }));
+          setFleet(mapped);
+        }
+      });
 
-  // Active hospital
-  const activeHospital = hospitals.find(h => h.id === activeHospitalId) || hospitals[0];
+      supabase.from('incidents').select('*').order('created_at', { ascending: false }).then(({ data }) => {
+        if (data) {
+          const mapped: Incident[] = data.map((i: any) => ({
+            id: i.id,
+            type: i.type,
+            title: i.title,
+            description: i.description || undefined,
+            severity: i.severity || undefined,
+            status: i.status,
+            lat: i.lat,
+            lng: i.lng,
+            address: i.address_label || 'Emergency Location',
+            createdAt: new Date(i.created_at).getTime(),
+            updatedAt: new Date(i.updated_at).getTime(),
+            citizenToken: i.citizen_token,
+            assignedUnitId: i.assigned_unit_id,
+            assignedHospitalId: i.assigned_hospital_id,
+            etaSeconds: i.eta_seconds || 240,
+            distanceKm: i.distance_km || 1.2,
+            timeline: []
+          }));
+          setIncidents(mapped);
+        }
+      });
+
+      // Realtime channel
+      const channel = supabase
+        .channel('resqnet_realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'incidents' }, (payload: any) => {
+          if (payload.eventType === 'INSERT') {
+            const newRow = payload.new;
+            const inc: Incident = {
+              id: newRow.id,
+              type: newRow.type,
+              title: newRow.title,
+              description: newRow.description,
+              severity: newRow.severity,
+              status: newRow.status,
+              lat: newRow.lat,
+              lng: newRow.lng,
+              address: newRow.address_label || 'Emergency Location',
+              createdAt: new Date(newRow.created_at).getTime(),
+              updatedAt: new Date(newRow.updated_at).getTime(),
+              citizenToken: newRow.citizen_token,
+              assignedUnitId: newRow.assigned_unit_id,
+              assignedHospitalId: newRow.assigned_hospital_id,
+              etaSeconds: newRow.eta_seconds || 240,
+              distanceKm: newRow.distance_km || 1.2,
+              timeline: []
+            };
+            setIncidents(prev => [inc, ...prev.filter(x => x.id !== inc.id)]);
+          } else if (payload.eventType === 'UPDATE') {
+            const upd = payload.new;
+            setIncidents(prev => prev.map(x => (x.id === upd.id ? {
+              ...x,
+              status: upd.status,
+              severity: upd.severity,
+              description: upd.description,
+              assignedUnitId: upd.assigned_unit_id,
+              assignedHospitalId: upd.assigned_hospital_id,
+              etaSeconds: upd.eta_seconds || x.etaSeconds,
+            } : x)));
+          }
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'units' }, (payload: any) => {
+          if (payload.eventType === 'UPDATE') {
+            const upd = payload.new;
+            setFleet(prev => prev.map(u => (u.id === upd.id ? {
+              ...u,
+              status: upd.status,
+              lat: upd.lat ?? u.lat,
+              lng: upd.lng ?? u.lng,
+            } : u)));
+          }
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'hospitals' }, (payload: any) => {
+          if (payload.eventType === 'UPDATE') {
+            const upd = payload.new;
+            setHospitals(prev => prev.map(h => (h.id === upd.id ? {
+              ...h,
+              status: upd.status,
+              occupiedBeds: upd.occupied_beds ?? h.occupiedBeds,
+            } : h)));
+          }
+        })
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(channel);
+      };
+    }
+  }, []);
+
+  const activeCitizenIncident = activeCitizenIncidentId
+    ? incidents.find(i => i.id === activeCitizenIncidentId && i.status !== 'resolved' && i.status !== 'cancelled') || null
+    : null;
 
   const toggleMute = () => {
-    const nextMute = !isMuted;
-    setIsMuted(nextMute);
-    sound.setMuted(nextMute);
+    const next = !isMuted;
+    setIsMuted(next);
+    sound.setMuted(next);
   };
 
-  // --- ACTIONS ---
-
   // 1. Citizen Triggers SOS
-  const triggerCitizenSos = useCallback((
-    type: EmergencyType, 
-    customLat?: number, 
-    customLng?: number, 
-    customAddress?: string
-  ): string => {
+  const triggerCitizenSos = useCallback(async (
+    type: EmergencyType,
+    lat: number = MARINA_BEACH_COORDS.lat,
+    lng: number = MARINA_BEACH_COORDS.lng,
+    address: string = MARINA_BEACH_COORDS.address
+  ): Promise<string> => {
     const newId = `INC-${Date.now().toString().slice(-4)}`;
-    const lat = customLat || MARINA_BEACH_COORDS.lat;
-    const lng = customLng || MARINA_BEACH_COORDS.lng;
-    const address = customAddress || MARINA_BEACH_COORDS.address;
+    
+    // Auto-assign best hospital immediately for medical emergencies
+    const autoHospital = type === 'medical' ? findBestHospital(type, undefined, lat, lng, hospitals) : null;
 
     const titles: Record<EmergencyType, string> = {
-      medical: "Critical Medical Emergency (Cardiac/Trauma)",
-      fire: "Structural Fire / Rescue Hazard",
-      police: "Immediate Police / Security Response"
+      medical: "Critical Medical Emergency",
+      fire: "Structural Fire / Hazard Alert",
+      police: "Security / Police Emergency"
     };
 
     const newIncident: Incident = {
       id: newId,
       type,
       title: titles[type],
-      description: `Citizen emergency SOS triggered from mobile device near ${address.split(',')[0]}`,
       status: 'pending',
       lat,
       lng,
       address,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      etaSeconds: 240, // 4 mins initial estimate
+      assignedHospitalId: autoHospital?.id,
+      etaSeconds: 240,
       distanceKm: 1.2,
       timeline: [
         {
@@ -172,17 +361,90 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       ]
     };
 
-    const updatedIncidents = [newIncident, ...incidents];
-    setIncidents(updatedIncidents);
-    broadcastState(updatedIncidents, fleet, hospitals);
-
+    const nextIncidents = [newIncident, ...incidents];
+    setIncidents(nextIncidents);
+    setActiveCitizenIncidentId(newId);
+    localStorage.setItem('resqnet_active_citizen_inc_id', newId);
+    broadcastAll(nextIncidents, fleet, hospitals);
     sound.playEmergencyAlarm();
-    return newId;
-  }, [incidents, fleet, hospitals, broadcastState]);
 
-  // 2. Citizen Cancels SOS
-  const cancelCitizenSos = useCallback((incidentId: string) => {
-    const updatedIncidents = incidents.map(inc => {
+    // Supabase insert if configured
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('incidents').insert({
+          type,
+          title: titles[type],
+          status: 'pending',
+          lat,
+          lng,
+          address_label: address,
+          assigned_hospital_id: autoHospital?.id,
+          eta_seconds: 240,
+          distance_km: 1.2
+        });
+      } catch (err) {
+        console.error('Supabase incident insert error:', err);
+      }
+    }
+
+    return newId;
+  }, [incidents, fleet, hospitals, broadcastAll]);
+
+  // 2. Citizen Updates Optional Details (Severity & Description)
+  const updateCitizenIncidentDetails = useCallback(async (
+    incidentId: string,
+    severity: IncidentSeverity,
+    description: string
+  ) => {
+    const targetInc = incidents.find(i => i.id === incidentId);
+    const autoHospital = targetInc && targetInc.type === 'medical'
+      ? findBestHospital(targetInc.type, severity, targetInc.lat, targetInc.lng, hospitals)
+      : null;
+
+    const nextIncidents = incidents.map(inc => {
+      if (inc.id === incidentId) {
+        return {
+          ...inc,
+          severity,
+          description,
+          assignedHospitalId: autoHospital ? autoHospital.id : inc.assignedHospitalId,
+          updatedAt: Date.now(),
+          timeline: [
+            ...inc.timeline,
+            {
+              id: `tl-${Date.now()}`,
+              time: Date.now(),
+              status: inc.status,
+              text: `Citizen provided details: Severity ${severity} • "${description}"`,
+              actor: 'Citizen' as const
+            }
+          ]
+        };
+      }
+      return inc;
+    });
+
+    setIncidents(nextIncidents);
+    broadcastAll(nextIncidents, fleet, hospitals);
+    sound.playTactileClick();
+
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('incidents').update({
+          severity,
+          description,
+          assigned_hospital_id: autoHospital ? autoHospital.id : undefined,
+          updated_at: new Date().toISOString()
+        }).eq('id', incidentId);
+      } catch (err) {
+        console.error('Supabase incident update error:', err);
+      }
+    }
+  }, [incidents, fleet, hospitals, broadcastAll]);
+
+  // 3. Citizen Cancels SOS
+  const cancelCitizenSos = useCallback(async (incidentId: string) => {
+    const nextIncidents = incidents.map(inc => {
       if (inc.id === incidentId) {
         return {
           ...inc,
@@ -194,7 +456,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               id: `tl-${Date.now()}`,
               time: Date.now(),
               status: 'cancelled' as const,
-              text: 'Citizen cancelled alarm (False Alarm reported)',
+              text: 'Citizen cancelled SOS (False Alarm reported)',
               actor: 'Citizen' as const
             }
           ]
@@ -203,36 +465,65 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return inc;
     });
 
-    // If unit was assigned, free it
-    const cancelledInc = incidents.find(i => i.id === incidentId);
-    let updatedFleet = fleet;
-    if (cancelledInc && cancelledInc.assignedUnitId) {
-      updatedFleet = fleet.map(u => 
-        u.id === cancelledInc.assignedUnitId ? { ...u, status: 'available' as const, currentIncidentId: undefined } : u
+    // Free assigned responder unit
+    const cancelled = incidents.find(i => i.id === incidentId);
+    let nextFleet = fleet;
+    if (cancelled?.assignedUnitId) {
+      nextFleet = fleet.map(u => 
+        u.id === cancelled.assignedUnitId ? { ...u, status: 'available' as const, currentIncidentId: undefined } : u
       );
-      setFleet(updatedFleet);
+      setFleet(nextFleet);
     }
 
-    setIncidents(updatedIncidents);
-    broadcastState(updatedIncidents, updatedFleet, hospitals);
+    setIncidents(nextIncidents);
+    setActiveCitizenIncidentId(null);
+    localStorage.removeItem('resqnet_active_citizen_inc_id');
+    broadcastAll(nextIncidents, nextFleet, hospitals);
     sound.playTactileClick();
-  }, [incidents, fleet, hospitals, broadcastState]);
 
-  // 3. Dispatch Center Assigns Responder
-  const assignResponderToIncident = useCallback((incidentId: string, unitId: string) => {
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('incidents').update({ status: 'cancelled', updated_at: new Date().toISOString() }).eq('id', incidentId);
+        if (cancelled?.assignedUnitId) {
+          await supabase.from('units').update({ status: 'available', updated_at: new Date().toISOString() }).eq('id', cancelled.assignedUnitId);
+        }
+      } catch (err) {
+        console.error('Supabase cancel error:', err);
+      }
+    }
+  }, [incidents, fleet, hospitals, broadcastAll]);
+
+  // 4. Dispatcher Assigns Unit
+  const assignResponderToIncident = useCallback(async (incidentId: string, unitId: string) => {
     const unit = fleet.find(u => u.id === unitId);
     const incident = incidents.find(i => i.id === incidentId);
     if (!unit || !incident) return;
 
-    const dist = calculateDistanceKm(unit.lat, unit.lng, incident.lat, incident.lng);
-    const calculatedEta = Math.max(90, Math.round((dist / 40) * 3600)); // ~40km/h city speed
+    // Ensure type safety: unit matches incident type
+    const isMatched = 
+      (incident.type === 'medical' && unit.type === 'ambulance') ||
+      (incident.type === 'fire' && unit.type === 'firetruck') ||
+      (incident.type === 'police' && unit.type === 'police_cruiser');
 
-    const updatedIncidents = incidents.map(inc => {
+    if (!isMatched) {
+      console.warn(`Unit ${unit.callsign} (${unit.type}) does not match incident type ${incident.type}`);
+    }
+
+    const dist = calculateDistanceKm(unit.lat, unit.lng, incident.lat, incident.lng);
+    const calculatedEta = Math.max(90, Math.round((dist / 40) * 3600));
+
+    // Auto-hospital check
+    const autoHospital = incident.assignedHospitalId 
+      ? hospitals.find(h => h.id === incident.assignedHospitalId)
+      : findBestHospital(incident.type, incident.severity, incident.lat, incident.lng, hospitals);
+
+    const nextIncidents = incidents.map(inc => {
       if (inc.id === incidentId) {
         return {
           ...inc,
           status: 'assigned' as const,
           assignedUnitId: unitId,
+          assignedHospitalId: autoHospital?.id || inc.assignedHospitalId,
           distanceKm: dist,
           etaSeconds: calculatedEta,
           updatedAt: Date.now(),
@@ -251,35 +542,89 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return inc;
     });
 
-    const updatedFleet = fleet.map(u => {
+    const nextFleet = fleet.map(u => {
       if (u.id === unitId) {
         return {
           ...u,
           status: 'dispatched' as const,
-          currentIncidentId: incidentId
+          currentIncidentId: incidentId,
+          assignedHospitalId: autoHospital?.id
         };
       }
       return u;
     });
 
-    setIncidents(updatedIncidents);
-    setFleet(updatedFleet);
-    broadcastState(updatedIncidents, updatedFleet, hospitals);
+    setIncidents(nextIncidents);
+    setFleet(nextFleet);
+    broadcastAll(nextIncidents, nextFleet, hospitals);
     sound.playEmergencyAlarm();
-  }, [incidents, fleet, hospitals, broadcastState]);
 
-  // 4. Responder Accepts Mission
-  const acceptMission = useCallback((unitId: string) => {
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('incidents').update({
+          status: 'assigned',
+          assigned_unit_id: unitId,
+          assigned_hospital_id: autoHospital?.id,
+          eta_seconds: calculatedEta,
+          distance_km: dist,
+          updated_at: new Date().toISOString()
+        }).eq('id', incidentId);
+
+        await supabase.from('units').update({
+          status: 'dispatched',
+          updated_at: new Date().toISOString()
+        }).eq('id', unitId);
+      } catch (err) {
+        console.error('Supabase assign error:', err);
+      }
+    }
+  }, [incidents, fleet, hospitals, broadcastAll]);
+
+  // Dispatch Manual Hospital Override
+  const overrideAssignedHospital = useCallback(async (incidentId: string, hospitalId: string) => {
+    const nextIncidents = incidents.map(inc => {
+      if (inc.id === incidentId) {
+        return {
+          ...inc,
+          assignedHospitalId: hospitalId,
+          updatedAt: Date.now()
+        };
+      }
+      return inc;
+    });
+
+    const nextFleet = fleet.map(u => {
+      if (u.currentIncidentId === incidentId) {
+        return {
+          ...u,
+          assignedHospitalId: hospitalId
+        };
+      }
+      return u;
+    });
+
+    setIncidents(nextIncidents);
+    setFleet(nextFleet);
+    broadcastAll(nextIncidents, nextFleet, hospitals);
+    sound.playTactileClick();
+  }, [incidents, fleet, hospitals, broadcastAll]);
+
+  // 5. Responder Accepts Mission -> Leg 1 Turn-by-Turn Navigation (Unit -> Scene)
+  const acceptMission = useCallback(async (unitId: string) => {
     const unit = fleet.find(u => u.id === unitId);
     if (!unit || !unit.currentIncidentId) return;
 
     const incident = incidents.find(i => i.id === unit.currentIncidentId);
     if (!incident) return;
 
-    // Generate driving route from unit location to incident location
-    const route = generateRoutePoints([unit.lat, unit.lng], [incident.lat, incident.lng], 30);
+    // Calculate real turn-by-turn route to scene (Leg 1)
+    const route = await calculateTurnByTurnRoute(
+      [unit.lat, unit.lng],
+      [incident.lat, incident.lng],
+      `Scene (${incident.address.split(',')[0]})`
+    );
 
-    const updatedIncidents = incidents.map(inc => {
+    const nextIncidents = incidents.map(inc => {
       if (inc.id === unit.currentIncidentId) {
         return {
           ...inc,
@@ -291,7 +636,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               id: `tl-${Date.now()}`,
               time: Date.now(),
               status: 'en_route' as const,
-              text: `${unit.callsign} crew accepted mission and is En Route with sirens active`,
+              text: `${unit.callsign} accepted mission and is navigating to scene`,
               actor: 'Responder' as const
             }
           ]
@@ -300,34 +645,45 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return inc;
     });
 
-    const updatedFleet = fleet.map(u => {
+    const nextFleet = fleet.map(u => {
       if (u.id === unitId) {
         return {
           ...u,
           status: 'en_route' as const,
           speedKmh: 58,
-          routeCoords: route,
-          routeIndex: 0
+          routeCoords: route.coordinates,
+          routeIndex: 0,
+          navigationSteps: route.steps,
+          currentStepIndex: 0
         };
       }
       return u;
     });
 
-    setIncidents(updatedIncidents);
-    setFleet(updatedFleet);
-    broadcastState(updatedIncidents, updatedFleet, hospitals);
+    setIncidents(nextIncidents);
+    setFleet(nextFleet);
+    broadcastAll(nextIncidents, nextFleet, hospitals);
     sound.playTactileClick();
-  }, [fleet, incidents, hospitals, broadcastState]);
 
-  // 5. Responder Marks "Arrived on Scene"
-  const markArrivedOnScene = useCallback((unitId: string) => {
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('incidents').update({ status: 'en_route', updated_at: new Date().toISOString() }).eq('id', incident.id);
+        await supabase.from('units').update({ status: 'en_route', updated_at: new Date().toISOString() }).eq('id', unitId);
+      } catch (err) {
+        console.error('Supabase accept mission error:', err);
+      }
+    }
+  }, [fleet, incidents, hospitals, broadcastAll]);
+
+  // 6. Responder Marks Arrived On Scene
+  const markArrivedOnScene = useCallback(async (unitId: string) => {
     const unit = fleet.find(u => u.id === unitId);
     if (!unit || !unit.currentIncidentId) return;
 
     const incident = incidents.find(i => i.id === unit.currentIncidentId);
     if (!incident) return;
 
-    const updatedIncidents = incidents.map(inc => {
+    const nextIncidents = incidents.map(inc => {
       if (inc.id === unit.currentIncidentId) {
         return {
           ...inc,
@@ -335,12 +691,12 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           etaSeconds: 0,
           updatedAt: Date.now(),
           patientVitals: {
-            condition: "Acute Myocardial Infarction / Chest Pain",
-            severity: "CRITICAL" as const,
-            bloodPressure: "155/95",
-            heartRate: 112,
-            oxygenSat: 92,
-            notes: "Oxygen administered, IV line established. Immediate cardiac intervention required."
+            condition: "Acute Triage & Trauma Assessment",
+            severity: inc.severity || ("CRITICAL" as const),
+            bloodPressure: "148/92",
+            heartRate: 110,
+            oxygenSat: 94,
+            notes: "Vitals stabilized. Oxygen administered."
           },
           timeline: [
             ...inc.timeline,
@@ -348,7 +704,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               id: `tl-${Date.now()}`,
               time: Date.now(),
               status: 'on_scene' as const,
-              text: `${unit.callsign} arrived on scene. Paramedics assessing & stabilizing patient.`,
+              text: `${unit.callsign} arrived on scene. First responders assessing patient.`,
               actor: 'Responder' as const
             }
           ]
@@ -357,7 +713,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return inc;
     });
 
-    const updatedFleet = fleet.map(u => {
+    const nextFleet = fleet.map(u => {
       if (u.id === unitId) {
         return {
           ...u,
@@ -366,48 +722,69 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           lat: incident.lat,
           lng: incident.lng,
           routeCoords: undefined,
-          routeIndex: 0
+          routeIndex: 0,
+          navigationSteps: undefined,
+          currentStepIndex: 0
         };
       }
       return u;
     });
 
-    setIncidents(updatedIncidents);
-    setFleet(updatedFleet);
-    broadcastState(updatedIncidents, updatedFleet, hospitals);
+    setIncidents(nextIncidents);
+    setFleet(nextFleet);
+    broadcastAll(nextIncidents, nextFleet, hospitals);
     sound.playTactileClick();
-  }, [fleet, incidents, hospitals, broadcastState]);
 
-  // 6. Responder Starts Hospital Transport
-  const startHospitalTransport = useCallback((unitId: string, hospitalId: string, customVitals?: PatientVitals) => {
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('incidents').update({ status: 'on_scene', updated_at: new Date().toISOString() }).eq('id', incident.id);
+        await supabase.from('units').update({ status: 'on_scene', lat: incident.lat, lng: incident.lng, updated_at: new Date().toISOString() }).eq('id', unitId);
+      } catch (err) {
+        console.error('Supabase on scene error:', err);
+      }
+    }
+  }, [fleet, incidents, hospitals, broadcastAll]);
+
+  // 7. Responder Starts Hospital Transport -> Leg 2 Turn-by-Turn Navigation (Scene -> Auto-Assigned Hospital)
+  const startHospitalTransport = useCallback(async (unitId: string, customVitals?: PatientVitals) => {
     const unit = fleet.find(u => u.id === unitId);
-    const hospital = hospitals.find(h => h.id === hospitalId);
-    if (!unit || !unit.currentIncidentId || !hospital) return;
+    if (!unit || !unit.currentIncidentId) return;
 
     const incident = incidents.find(i => i.id === unit.currentIncidentId);
     if (!incident) return;
 
-    const distToHosp = calculateDistanceKm(unit.lat, unit.lng, hospital.lat, hospital.lng);
-    const etaToHospSec = Math.round((distToHosp / 45) * 3600); // 45km/h priority ambulance speed (~8 mins)
-    const route = generateRoutePoints([unit.lat, unit.lng], [hospital.lat, hospital.lng], 35);
+    // Use auto-assigned hospital
+    const targetHospId = incident.assignedHospitalId || unit.assignedHospitalId;
+    let hospital = hospitals.find(h => h.id === targetHospId && h.status === 'accepting');
+    if (!hospital) {
+      // Re-evaluate best accepting hospital if assigned one went full
+      hospital = findBestHospital(incident.type, incident.severity, unit.lat, unit.lng, hospitals) || hospitals[0];
+    }
+
+    // Calculate Leg 2 turn-by-turn route to hospital
+    const route = await calculateTurnByTurnRoute(
+      [unit.lat, unit.lng],
+      [hospital.lat, hospital.lng],
+      hospital.name
+    );
 
     const vitals = customVitals || incident.patientVitals || {
       condition: "Cardiac Patient - High Priority",
-      severity: "CRITICAL" as const,
-      bloodPressure: "150/92",
-      heartRate: 108,
-      oxygenSat: 94,
-      notes: "Direct transit to Cath Lab requested."
+      severity: incident.severity || ("CRITICAL" as const),
+      bloodPressure: "145/90",
+      heartRate: 104,
+      oxygenSat: 95,
+      notes: "In transit to Emergency ICU Trauma Bay."
     };
 
-    const updatedIncidents = incidents.map(inc => {
+    const nextIncidents = incidents.map(inc => {
       if (inc.id === unit.currentIncidentId) {
         return {
           ...inc,
           status: 'transporting' as const,
-          targetHospitalId: hospitalId,
-          distanceKm: distToHosp,
-          etaSeconds: etaToHospSec,
+          assignedHospitalId: hospital.id,
+          distanceKm: parseFloat((route.distanceMeters / 1000).toFixed(2)),
+          etaSeconds: route.durationSeconds,
           patientVitals: vitals,
           updatedAt: Date.now(),
           timeline: [
@@ -416,7 +793,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               id: `tl-${Date.now()}`,
               time: Date.now(),
               status: 'transporting' as const,
-              text: `Transporting patient to ${hospital.name}. Live inbound alert broadcast to ER team. (ETA: ${Math.ceil(etaToHospSec/60)} mins)`,
+              text: `Transporting to ${hospital.name}. Live inbound alert broadcast to ER Trauma Team.`,
               actor: 'Responder' as const
             }
           ]
@@ -425,37 +802,56 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return inc;
     });
 
-    const updatedFleet = fleet.map(u => {
+    const nextFleet = fleet.map(u => {
       if (u.id === unitId) {
         return {
           ...u,
           status: 'transporting' as const,
-          targetHospitalId: hospitalId,
+          assignedHospitalId: hospital.id,
           speedKmh: 64,
-          routeCoords: route,
-          routeIndex: 0
+          routeCoords: route.coordinates,
+          routeIndex: 0,
+          navigationSteps: route.steps,
+          currentStepIndex: 0
         };
       }
       return u;
     });
 
-    setIncidents(updatedIncidents);
-    setFleet(updatedFleet);
-    broadcastState(updatedIncidents, updatedFleet, hospitals);
-
-    // ER Monitor chime
+    setIncidents(nextIncidents);
+    setFleet(nextFleet);
+    broadcastAll(nextIncidents, nextFleet, hospitals);
     sound.playHospitalChime();
-  }, [fleet, hospitals, incidents, broadcastState]);
 
-  // 7. Responder Marks "Arrived at Hospital"
-  const markArrivedAtHospital = useCallback((unitId: string) => {
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('incidents').update({
+          status: 'transporting',
+          assigned_hospital_id: hospital.id,
+          eta_seconds: route.durationSeconds,
+          distance_km: parseFloat((route.distanceMeters / 1000).toFixed(2)),
+          updated_at: new Date().toISOString()
+        }).eq('id', incident.id);
+
+        await supabase.from('units').update({
+          status: 'transporting',
+          updated_at: new Date().toISOString()
+        }).eq('id', unitId);
+      } catch (err) {
+        console.error('Supabase start transport error:', err);
+      }
+    }
+  }, [fleet, hospitals, incidents, broadcastAll]);
+
+  // 8. Responder Arrives at Hospital Trauma Bay
+  const markArrivedAtHospital = useCallback(async (unitId: string) => {
     const unit = fleet.find(u => u.id === unitId);
-    if (!unit || !unit.currentIncidentId || !unit.targetHospitalId) return;
+    if (!unit || !unit.currentIncidentId || !unit.assignedHospitalId) return;
 
-    const hospital = hospitals.find(h => h.id === unit.targetHospitalId);
+    const hospital = hospitals.find(h => h.id === unit.assignedHospitalId);
     if (!hospital) return;
 
-    const updatedIncidents = incidents.map(inc => {
+    const nextIncidents = incidents.map(inc => {
       if (inc.id === unit.currentIncidentId) {
         return {
           ...inc,
@@ -467,7 +863,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               id: `tl-${Date.now()}`,
               time: Date.now(),
               status: inc.status,
-              text: `${unit.callsign} pulled into ${hospital.name} Trauma Bay. Transferring patient.`,
+              text: `${unit.callsign} reached ${hospital.name} Trauma Bay. Handing off patient.`,
               actor: 'Responder' as const
             }
           ]
@@ -476,7 +872,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return inc;
     });
 
-    const updatedFleet = fleet.map(u => {
+    const nextFleet = fleet.map(u => {
       if (u.id === unitId) {
         return {
           ...u,
@@ -484,21 +880,23 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           lat: hospital.lat,
           lng: hospital.lng,
           routeCoords: undefined,
-          routeIndex: 0
+          routeIndex: 0,
+          navigationSteps: undefined,
+          currentStepIndex: 0
         };
       }
       return u;
     });
 
-    setIncidents(updatedIncidents);
-    setFleet(updatedFleet);
-    broadcastState(updatedIncidents, updatedFleet, hospitals);
+    setIncidents(nextIncidents);
+    setFleet(nextFleet);
+    broadcastAll(nextIncidents, nextFleet, hospitals);
     sound.playHospitalChime();
-  }, [fleet, hospitals, incidents, broadcastState]);
+  }, [fleet, hospitals, incidents, broadcastAll]);
 
-  // 8. Hospital Toggles ER Capacity (Accepting <-> Full)
-  const toggleHospitalCapacity = useCallback((hospitalId: string) => {
-    const updatedHospitals = hospitals.map(h => {
+  // 9. Hospital Toggles ER Capacity
+  const toggleHospitalCapacity = useCallback(async (hospitalId: string) => {
+    const nextHospitals = hospitals.map(h => {
       if (h.id === hospitalId) {
         const nextStatus = h.status === 'accepting' ? ('full' as const) : ('accepting' as const);
         return {
@@ -511,17 +909,32 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return h;
     });
 
-    setHospitals(updatedHospitals);
-    broadcastState(incidents, fleet, updatedHospitals);
+    setHospitals(nextHospitals);
+    broadcastAll(incidents, fleet, nextHospitals);
     sound.playTactileClick();
-  }, [hospitals, incidents, fleet, broadcastState]);
 
-  // 9. Hospital Receives Patient & Closes Loop
-  const receivePatientAdmit = useCallback((hospitalId: string, incidentId: string) => {
+    if (isSupabaseConfigured) {
+      const target = nextHospitals.find(h => h.id === hospitalId);
+      if (target) {
+        try {
+          await supabase.from('hospitals').update({
+            status: target.status,
+            occupied_beds: target.occupiedBeds,
+            updated_at: new Date().toISOString()
+          }).eq('id', hospitalId);
+        } catch (err) {
+          console.error('Supabase hospital status update error:', err);
+        }
+      }
+    }
+  }, [hospitals, incidents, fleet, broadcastAll]);
+
+  // 10. Hospital Receives Patient & Closes Loop
+  const receivePatientAdmit = useCallback(async (hospitalId: string, incidentId: string) => {
     const incident = incidents.find(i => i.id === incidentId);
     const assignedUnitId = incident?.assignedUnitId;
 
-    const updatedIncidents = incidents.map(inc => {
+    const nextIncidents = incidents.map(inc => {
       if (inc.id === incidentId) {
         return {
           ...inc,
@@ -534,7 +947,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               id: `tl-${Date.now()}`,
               time: Date.now(),
               status: 'resolved' as const,
-              text: `Patient admitted to Emergency ICU. Emergency resolved successfully.`,
+              text: `Patient admitted to Emergency Care. Incident loop closed.`,
               actor: 'Hospital' as const
             }
           ]
@@ -543,24 +956,25 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return inc;
     });
 
-    // Free the responder unit back to available at hospital location
-    const updatedFleet = fleet.map(u => {
+    // Free responder unit back to available at hospital position
+    const nextFleet = fleet.map(u => {
       if (u.id === assignedUnitId) {
         return {
           ...u,
           status: 'available' as const,
           currentIncidentId: undefined,
-          targetHospitalId: undefined,
+          assignedHospitalId: undefined,
           speedKmh: 0,
           routeCoords: undefined,
-          routeIndex: 0
+          routeIndex: 0,
+          navigationSteps: undefined,
+          currentStepIndex: 0
         };
       }
       return u;
     });
 
-    // Increase hospital occupied beds
-    const updatedHospitals = hospitals.map(h => {
+    const nextHospitals = hospitals.map(h => {
       if (h.id === hospitalId) {
         return {
           ...h,
@@ -571,17 +985,27 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return h;
     });
 
-    setIncidents(updatedIncidents);
-    setFleet(updatedFleet);
-    setHospitals(updatedHospitals);
-    broadcastState(updatedIncidents, updatedFleet, updatedHospitals);
-
+    setIncidents(nextIncidents);
+    setFleet(nextFleet);
+    setHospitals(nextHospitals);
+    broadcastAll(nextIncidents, nextFleet, nextHospitals);
     sound.playSuccessChime();
-  }, [incidents, fleet, hospitals, broadcastState]);
 
-  // Toggle Responder Duty
-  const toggleDutyStatus = useCallback((unitId: string) => {
-    const updatedFleet = fleet.map(u => {
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('incidents').update({ status: 'resolved', updated_at: new Date().toISOString() }).eq('id', incidentId);
+        if (assignedUnitId) {
+          await supabase.from('units').update({ status: 'available', updated_at: new Date().toISOString() }).eq('id', assignedUnitId);
+        }
+      } catch (err) {
+        console.error('Supabase admit error:', err);
+      }
+    }
+  }, [incidents, fleet, hospitals, broadcastAll]);
+
+  // Toggle Responder Duty Status
+  const toggleDutyStatus = useCallback(async (unitId: string) => {
+    const nextFleet = fleet.map(u => {
       if (u.id === unitId) {
         return {
           ...u,
@@ -590,12 +1014,24 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
       return u;
     });
-    setFleet(updatedFleet);
-    broadcastState(incidents, updatedFleet, hospitals);
-    sound.playTactileClick();
-  }, [fleet, incidents, hospitals, broadcastState]);
 
-  // Simulation Tick Loop
+    setFleet(nextFleet);
+    broadcastAll(incidents, nextFleet, hospitals);
+    sound.playTactileClick();
+
+    if (isSupabaseConfigured) {
+      const u = nextFleet.find(x => x.id === unitId);
+      if (u) {
+        try {
+          await supabase.from('units').update({ status: u.status, updated_at: new Date().toISOString() }).eq('id', unitId);
+        } catch (err) {
+          console.error('Supabase duty toggle error:', err);
+        }
+      }
+    }
+  }, [fleet, incidents, hospitals, broadcastAll]);
+
+  // Simulation loop for smooth vehicle movement along route
   useEffect(() => {
     const timer = setInterval(() => {
       setFleet(prevFleet => {
@@ -613,22 +1049,29 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
               const dLng = nextLng - prevPoint[1];
               const heading = Math.round((Math.atan2(dLng, dLat) * 180) / Math.PI + 360) % 360;
 
+              // Step progression
+              const steps = unit.navigationSteps;
+              let stepIdx = unit.currentStepIndex || 0;
+              if (steps && steps.length > 0 && nextIndex % 7 === 0 && stepIdx < steps.length - 1) {
+                stepIdx += 1;
+              }
+
               return {
                 ...unit,
                 lat: nextLat,
                 lng: nextLng,
                 heading,
-                routeIndex: nextIndex
+                routeIndex: nextIndex,
+                currentStepIndex: stepIdx
               };
             }
           }
           return unit;
         });
-
         return hasChanges ? nextFleet : prevFleet;
       });
 
-      // Decrement ETA seconds for active incidents
+      // Decrement ETA
       setIncidents(prevInc => {
         let hasChanges = false;
         const nextInc = prevInc.map(inc => {
@@ -648,71 +1091,19 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     return () => clearInterval(timer);
   }, []);
 
-  // Reset Simulation
-  const resetToInitialDemo = useCallback(() => {
+  // Reset Simulation Data
+  const resetData = useCallback(async () => {
     setIncidents([]);
     setFleet(INITIAL_FLEET);
     setHospitals(INITIAL_HOSPITALS);
-    setPitchStep(0);
-    setIsPitchPlaying(false);
-    broadcastState([], INITIAL_FLEET, INITIAL_HOSPITALS);
+    setActiveCitizenIncidentId(null);
+    localStorage.removeItem('resqnet_active_citizen_inc_id');
+    localStorage.removeItem('resqnet_incidents_v2');
+    localStorage.removeItem('resqnet_fleet_v2');
+    localStorage.removeItem('resqnet_hospitals_v2');
+    broadcastAll([], INITIAL_FLEET, INITIAL_HOSPITALS);
     sound.playTactileClick();
-  }, [broadcastState]);
-
-  const executePitchStep = useCallback((step: number) => {
-    switch (step) {
-      case 1:
-        triggerCitizenSos('medical', MARINA_BEACH_COORDS.lat, MARINA_BEACH_COORDS.lng, MARINA_BEACH_COORDS.address);
-        break;
-      case 2:
-        if (incidents.length > 0) {
-          assignResponderToIncident(incidents[0].id, 'unit-1');
-        } else {
-          const incId = triggerCitizenSos('medical', MARINA_BEACH_COORDS.lat, MARINA_BEACH_COORDS.lng, MARINA_BEACH_COORDS.address);
-          setTimeout(() => assignResponderToIncident(incId, 'unit-1'), 300);
-        }
-        break;
-      case 3:
-        acceptMission('unit-1');
-        break;
-      case 4:
-        markArrivedOnScene('unit-1');
-        setTimeout(() => {
-          startHospitalTransport('unit-1', 'hosp-2');
-        }, 1200);
-        break;
-      case 5:
-        markArrivedAtHospital('unit-1');
-        break;
-      case 6:
-        {
-          const activeInc = incidents.find(i => i.status !== 'resolved' && i.status !== 'cancelled');
-          if (activeInc) {
-            receivePatientAdmit('hosp-2', activeInc.id);
-          }
-        }
-        break;
-      default:
-        break;
-    }
-  }, [incidents, triggerCitizenSos, assignResponderToIncident, acceptMission, markArrivedOnScene, startHospitalTransport, markArrivedAtHospital, receivePatientAdmit]);
-
-  const nextPitchStep = useCallback(() => {
-    setPitchStep(prev => {
-      const next = prev + 1;
-      executePitchStep(next);
-      return next;
-    });
-  }, [executePitchStep]);
-
-  const startGuidedPitch = useCallback(() => {
-    resetToInitialDemo();
-    setPitchStep(1);
-    setIsPitchPlaying(true);
-    setTimeout(() => {
-      executePitchStep(1);
-    }, 200);
-  }, [resetToInitialDemo, executePitchStep]);
+  }, [broadcastAll]);
 
   return (
     <EmergencyContext.Provider
@@ -720,20 +1111,14 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         incidents,
         fleet,
         hospitals,
-        activeIncident,
-        activeResponder,
-        activeHospital,
-        currentView,
+        activeCitizenIncident,
         isMuted,
-        pitchStep,
-        isPitchPlaying,
-        setCurrentView,
-        setActiveResponderId,
-        setActiveHospitalId,
         toggleMute,
         triggerCitizenSos,
+        updateCitizenIncidentDetails,
         cancelCitizenSos,
         assignResponderToIncident,
+        overrideAssignedHospital,
         acceptMission,
         markArrivedOnScene,
         startHospitalTransport,
@@ -741,10 +1126,7 @@ export const EmergencyProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         toggleDutyStatus,
         toggleHospitalCapacity,
         receivePatientAdmit,
-        setPitchStep,
-        startGuidedPitch,
-        nextPitchStep,
-        resetToInitialDemo
+        resetData
       }}
     >
       {children}

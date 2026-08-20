@@ -9,8 +9,8 @@ export const MARINA_BEACH_COORDS: { lat: number; lng: number; address: string } 
 export const INITIAL_HOSPITALS: Hospital[] = [
   {
     id: "hosp-1",
-    name: "Rajiv Gandhi Govt General Hospital (Hospital A)",
-    shortCode: "RGGGH-A",
+    name: "Rajiv Gandhi Govt General Hospital",
+    shortCode: "RGGGH",
     status: "full", // Initially full to showcase smart capacity diversion
     totalBeds: 350,
     occupiedBeds: 350,
@@ -23,8 +23,8 @@ export const INITIAL_HOSPITALS: Hospital[] = [
   },
   {
     id: "hosp-2",
-    name: "Apollo Main Hospital (Hospital B)",
-    shortCode: "APOLLO-B",
+    name: "Apollo Main Hospital",
+    shortCode: "APOLLO",
     status: "accepting",
     totalBeds: 220,
     occupiedBeds: 168,
@@ -37,8 +37,8 @@ export const INITIAL_HOSPITALS: Hospital[] = [
   },
   {
     id: "hosp-3",
-    name: "Fortis Malar Hospital (Hospital C)",
-    shortCode: "FORTIS-C",
+    name: "Fortis Malar Hospital",
+    shortCode: "FORTIS",
     status: "accepting",
     totalBeds: 180,
     occupiedBeds: 142,
@@ -52,7 +52,7 @@ export const INITIAL_HOSPITALS: Hospital[] = [
   {
     id: "hosp-4",
     name: "Govt Royapettah Hospital",
-    shortCode: "GRH-D",
+    shortCode: "GRH",
     status: "accepting",
     totalBeds: 260,
     occupiedBeds: 215,
@@ -151,9 +151,9 @@ export function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lo
   const a =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
     Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
+    Math.cos((lat2 * Math.PI) / 180) *
+    Math.sin(dLon / 2) *
+    Math.sin(dLon / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return parseFloat((R * c).toFixed(2));
 }

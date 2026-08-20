@@ -1,22 +1,15 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const supabaseUrl = 'https://ngqgzlcfxfexgpirggi.supabase.co';
+const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5ncWd6bGNmZnhmZXhncGlyZ2dpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcxMjYxMjIsImV4cCI6MjEwMjcwMjEyMn0.-qJxb6RYMaELt4KaT38FXiNyws2lzlz4UsOK2hGbscA';
 
 export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey && supabaseUrl.startsWith('http'));
 
-// Initialize Supabase client if configured, otherwise provide safe fallback client
-export const supabase = isSupabaseConfigured
-  ? createClient(supabaseUrl, supabaseAnonKey, {
-      realtime: {
-        params: {
-          eventsPerSecond: 10,
-        },
-      },
-    })
-  : createClient('https://placeholder.supabase.co', 'placeholder-anon-key', {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-      }
-    });
+// Initialize Supabase client
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  realtime: {
+    params: {
+      eventsPerSecond: 10,
+    },
+  },
+});
